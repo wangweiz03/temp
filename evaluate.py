@@ -1,5 +1,5 @@
 """
-OpenAI Codex evaluation driver for Experience Routed Search (ERS).
+Multi-harness evaluation driver for Experience Routed Search (ERS).
 
 ERS performs adaptive draft/debug/improve search with failure taxonomy and
 compact per-task memory:
@@ -13,12 +13,14 @@ compact per-task memory:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import textwrap
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -60,10 +62,29 @@ DEFAULT_ERROR_SKILL_FILE = Path(
     os.environ.get("MLE_ERROR_SKILL_FILE") or SKILLS_ROOT / "SKILL_error.md"
 )
 SANDBOX_BASE_URL = os.environ.get("MLE_SANDBOX_BASE_URL", "http://127.0.0.1:6580")
+DEFAULT_DATA_FILE = Path(
+    "/hpc_data/ktian/superml/dataset/automl_parquet_valid_low_current_fixed/eval.parquet"
+)
+HARNESS_CODEX = "codex"
+HARNESS_CLAUDE_CODE = "claude-code"
+HARNESS_CHOICES = (HARNESS_CODEX, HARNESS_CLAUDE_CODE)
+DEFAULT_MODELS = {
+    HARNESS_CODEX: "gpt-5.4",
+    HARNESS_CLAUDE_CODE: "claude-sonnet-4-6-cc",
+}
 SKILL_FILE_SUFFIXES = {".md", ".py", ".json", ".txt", ".yaml", ".yml"}
 SKILL_SKIP_DIRS = {"__pycache__", ".git", ".ipynb_checkpoints"}
 
-BACKEND_ID = "codex_cli_ers_eema_task_failure_skill_routing"
+BACKEND_ID = "multi_harness_ers_eema_task_failure_skill_routing"
+
+CLAUDE_OUTPUT_GUARDS = {
+    "planning": """You are running through a print-only Claude Code harness. Do not edit files.
+Return the complete planning.md content in exactly one fenced markdown block. Do not omit sections.""",
+    "coding": """You are running through a print-only Claude Code harness. Do not edit files.
+Return the complete solution.py content in exactly one fenced python block. Do not abbreviate or omit code.""",
+    "memory": """You are running through a print-only Claude Code harness. Do not edit files.
+Return the complete task memory in exactly one fenced markdown block.""",
+}
 
 DRAFT_TASK_SKILL_GUARD = """Draft branch contract:
 - Use the full task-specific Kaggle skill as the primary modeling recipe.
@@ -1231,62 +1252,36 @@ def build_no_plan_placeholder(
     )
 
 
-async def call_codex_cli(
-    work_dir: Path,
-    prompt_messages: list[dict[str, str]],
-    metadata: dict[str, Any],
-    system_prompt: str = SYSTEM_PROMPT,
-    model: str = "o4-mini",
-    reasoning_level: str = "high",
-    max_tokens: int = 32768,
-    temperature: float = 0.6,
-    trace_file: Path | None = None,
-    refinement_context: str | None = None,
-    skill_context: str | None = None,
-    phase_name: str = "coding",
-) -> tuple[str, dict[str, Any]]:
-    """
-    Call OpenAI Codex CLI for code generation via subprocess.
-    """
-    try:
-        work_dir.mkdir(parents=True, exist_ok=True)
-
-        task_name = metadata.get("task_name", "unknown")
-        prompt_parts = []
-
-        for msg in prompt_messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role and content:
-                prompt_parts.append(f"[{role.upper()}]\n{content}")
-
-        if refinement_context:
-            prompt_parts.append(f"\n[REFINEMENT CONTEXT]\n{refinement_context}")
-
-        prompt_parts.append(build_metadata_prompt(metadata))
-
-        prompt_sections = [
-            "[SYSTEM INSTRUCTIONS]",
-            system_prompt,
-        ]
-        if skill_context:
-            prompt_sections.extend(
-                [
-                    "",
-                    "[SELECTED SKILL CONTEXT]",
-                    skill_context,
-                ]
-            )
-        prompt_sections.extend(
-            [
-                "",
-                "[USER TASK]",
-                *prompt_parts,
-            ]
+def resolve_harness_and_model(harness_model: str, model: str | None) -> tuple[str, str]:
+    """Validate the harness/model binding and fill the harness-specific default."""
+    harness = harness_model.strip().lower()
+    if harness not in HARNESS_CHOICES:
+        raise ValueError(
+            f"Unknown harness model {harness_model!r}; choose one of {HARNESS_CHOICES}"
         )
-        full_prompt = "\n\n".join(prompt_sections)
 
-        cmd = [
+    resolved_model = (model or "").strip() or DEFAULT_MODELS[harness]
+    is_gpt = resolved_model.lower().startswith("gpt-")
+    if harness == HARNESS_CODEX and not is_gpt:
+        raise ValueError(
+            "The codex harness is restricted to GPT models (model name must start with 'gpt-')."
+        )
+    if harness == HARNESS_CLAUDE_CODE and is_gpt:
+        raise ValueError(
+            "The claude-code harness is for non-GPT API models; use --harness-model codex for GPT models."
+        )
+    return harness, resolved_model
+
+
+def build_harness_command(
+    harness_model: str,
+    model: str,
+    reasoning_level: str,
+    system_prompt: str,
+) -> list[str]:
+    """Build a credential-free CLI command for the selected harness."""
+    if harness_model == HARNESS_CODEX:
+        return [
             "codex",
             "exec",
             "--full-auto",
@@ -1297,17 +1292,218 @@ async def call_codex_cli(
             "-c",
             f"reasoning_level={json.dumps(reasoning_level)}",
         ]
+    if harness_model == HARNESS_CLAUDE_CODE:
+        return [
+            "claude",
+            "--print",
+            "--model",
+            model,
+            "--append-system-prompt",
+            system_prompt,
+        ]
+    raise ValueError(f"Unsupported harness model: {harness_model}")
 
-        env = dict(os.environ)
 
-        start_time = datetime.now()
-        trace_data = {
-            "timestamp": start_time.isoformat(),
-            "model": model,
-            "reasoning_level": reasoning_level,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "work_dir": str(work_dir),
+def extract_fenced_text(raw_text: str, language: str | None = None) -> str:
+    """Extract the first fenced payload, falling back to the complete response."""
+    if not raw_text:
+        return ""
+    if language:
+        pattern = rf"```{re.escape(language)}\s*\n?(.*?)```"
+        matches = re.findall(pattern, raw_text, flags=re.DOTALL | re.IGNORECASE)
+        if matches:
+            return textwrap.dedent(matches[0]).strip()
+    matches = re.findall(r"```(?:[A-Za-z0-9_+.-]+)?\s*\n?(.*?)```", raw_text, re.DOTALL)
+    return textwrap.dedent(matches[0]).strip() if matches else raw_text.strip()
+
+
+def extract_python_code(raw_text: str) -> str:
+    """Recover a complete parseable Python program from either harness output."""
+    candidates: list[str] = []
+    try:
+        extracted = extract_code(raw_text)
+        if extracted:
+            candidates.append(extracted)
+    except Exception:
+        pass
+    candidates.extend(
+        re.findall(
+            r"```(?:python|py)\s*\n?(.*?)```", raw_text, re.DOTALL | re.IGNORECASE
+        )
+    )
+    candidates.extend(re.findall(r"```\s*\n?(.*?)```", raw_text, re.DOTALL))
+    candidates.append(raw_text)
+
+    for candidate in candidates:
+        code = textwrap.dedent(candidate).strip()
+        if not code:
+            continue
+        try:
+            ast.parse(code)
+        except SyntaxError:
+            continue
+        return code + ("\n" if not code.endswith("\n") else "")
+    return ""
+
+
+async def run_harness_prompt(
+    work_dir: Path,
+    prompt: str,
+    system_prompt: str,
+    harness_model: str,
+    model: str,
+    reasoning_level: str,
+    max_tokens: int,
+    temperature: float,
+    trace_file: Path | None,
+    trace_context: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Run a prompt through Codex or Claude Code with a common trace contract."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cmd = build_harness_command(
+        harness_model=harness_model,
+        model=model,
+        reasoning_level=reasoning_level,
+        system_prompt=system_prompt,
+    )
+    env = dict(os.environ)
+    if harness_model == HARNESS_CLAUDE_CODE:
+        env.pop("CLAUDECODE", None)
+        env["ANTHROPIC_MODEL"] = model
+
+    start_time = datetime.now()
+    trace_data = {
+        "timestamp": start_time.isoformat(),
+        "harness_model": harness_model,
+        "model": model,
+        "reasoning_level": reasoning_level,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "work_dir": str(work_dir),
+        "prompt": prompt,
+        "cmd": cmd,
+        "anthropic_base_url_set": bool(env.get("ANTHROPIC_BASE_URL")),
+        "anthropic_api_key_set": bool(env.get("ANTHROPIC_API_KEY")),
+        "response_text": "",
+        "stderr": "",
+        "return_code": None,
+        "usage": {},
+        "duration_seconds": 0,
+        **trace_context,
+    }
+
+    logger.debug(
+        "Running %s harness with model %s in %s", harness_model, model, work_dir
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(work_dir),
+        env=env,
+    )
+    timeout_seconds = float(
+        os.environ.get("MLE_HARNESS_TIMEOUT_SECONDS")
+        or os.environ.get("CLAUDE_CLI_TIMEOUT_SECONDS")
+        or 3600
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode("utf-8")), timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(
+            f"{harness_model} harness timed out after {timeout_seconds:.0f}s"
+        )
+
+    response_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
+    usage = {
+        "input_tokens": len(prompt) // 4,
+        "output_tokens": len(response_text) // 4,
+    }
+    end_time = datetime.now()
+    trace_data.update(
+        {
+            "response_text": response_text,
+            "stderr": stderr_text,
+            "return_code": proc.returncode,
+            "usage": usage,
+            "duration_seconds": (end_time - start_time).total_seconds(),
+            "end_timestamp": end_time.isoformat(),
+        }
+    )
+    if trace_file:
+        trace_file.parent.mkdir(parents=True, exist_ok=True)
+        trace_file.write_text(
+            json.dumps(trace_data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{harness_model} harness failed with code {proc.returncode}: {stderr_text[:500]}"
+        )
+    return response_text, usage
+
+
+async def call_harness_cli(
+    work_dir: Path,
+    prompt_messages: list[dict[str, str]],
+    metadata: dict[str, Any],
+    system_prompt: str = SYSTEM_PROMPT,
+    harness_model: str = HARNESS_CODEX,
+    model: str = DEFAULT_MODELS[HARNESS_CODEX],
+    reasoning_level: str = "high",
+    max_tokens: int = 32768,
+    temperature: float = 0.6,
+    trace_file: Path | None = None,
+    refinement_context: str | None = None,
+    skill_context: str | None = None,
+    phase_name: str = "coding",
+) -> tuple[str, dict[str, Any]]:
+    """Call the selected coding-agent CLI with a shared ERS prompt."""
+    task_name = metadata.get("task_name", "unknown")
+    prompt_parts = []
+
+    for msg in prompt_messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            prompt_parts.append(f"[{role.upper()}]\n{content}")
+
+    if refinement_context:
+        prompt_parts.append(f"\n[REFINEMENT CONTEXT]\n{refinement_context}")
+
+    prompt_parts.append(build_metadata_prompt(metadata))
+
+    prompt_sections: list[str] = []
+    if harness_model == HARNESS_CODEX:
+        prompt_sections.extend(["[SYSTEM INSTRUCTIONS]", system_prompt])
+    elif phase_name in CLAUDE_OUTPUT_GUARDS:
+        prompt_sections.extend(
+            [
+                "[OUTPUT CONTRACT]",
+                CLAUDE_OUTPUT_GUARDS[phase_name],
+            ]
+        )
+    if skill_context:
+        prompt_sections.extend(["", "[SELECTED SKILL CONTEXT]", skill_context])
+    prompt_sections.extend(["", "[USER TASK]", *prompt_parts])
+    full_prompt = "\n\n".join(prompt_sections)
+
+    return await run_harness_prompt(
+        work_dir=work_dir,
+        prompt=full_prompt,
+        system_prompt=system_prompt,
+        harness_model=harness_model,
+        model=model,
+        reasoning_level=reasoning_level,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        trace_file=trace_file,
+        trace_context={
             "task_name": task_name,
             "prompt_messages": prompt_messages,
             "metadata": metadata,
@@ -1316,60 +1512,8 @@ async def call_codex_cli(
             "refinement_context": refinement_context,
             "skill_context_used": bool(skill_context),
             "full_prompt": full_prompt,
-            "cmd": cmd,
-            "response_text": "",
-            "stderr": "",
-            "return_code": None,
-            "usage": {},
-            "duration_seconds": 0,
-        }
-
-        logger.debug("Running Codex CLI: %s ... in %s", " ".join(cmd[:4]), work_dir)
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(work_dir),
-            env=env,
-        )
-
-        stdout, stderr = await proc.communicate(input=full_prompt.encode("utf-8"))
-
-        response_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
-
-        if proc.returncode != 0:
-            logger.warning("Codex CLI exited with code %s", proc.returncode)
-        if stderr_text:
-            logger.debug("Codex CLI stderr: %s", stderr_text[:500])
-
-        usage = {
-            "input_tokens": len(full_prompt) // 4,
-            "output_tokens": len(response_text) // 4,
-        }
-
-        end_time = datetime.now()
-        trace_data["response_text"] = response_text
-        trace_data["stderr"] = stderr_text
-        trace_data["return_code"] = proc.returncode
-        trace_data["usage"] = usage
-        trace_data["duration_seconds"] = (end_time - start_time).total_seconds()
-        trace_data["end_timestamp"] = end_time.isoformat()
-
-        if trace_file:
-            trace_file.parent.mkdir(parents=True, exist_ok=True)
-            trace_file.write_text(
-                json.dumps(trace_data, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            logger.info("Saved execution trace to %s", trace_file)
-
-        return response_text, usage
-
-    except Exception as e:
-        logger.error("Codex CLI call failed: %s", e)
-        raise
+        },
+    )
 
 
 async def generate_round_planning(
@@ -1378,6 +1522,7 @@ async def generate_round_planning(
     round_num: int,
     prompt_messages: list[dict[str, str]],
     metadata: dict[str, Any],
+    harness_model: str,
     model: str,
     reasoning_level: str,
     max_tokens: int,
@@ -1455,11 +1600,12 @@ async def generate_round_planning(
         if solution_file.exists():
             solution_file.unlink()
 
-        raw_text, attempt_usage = await call_codex_cli(
+        raw_text, attempt_usage = await call_harness_cli(
             work_dir=work_dir,
             prompt_messages=prompt_messages,
             metadata=metadata,
             system_prompt=PLANNING_SYSTEM_PROMPT,
+            harness_model=harness_model,
             model=model,
             reasoning_level=reasoning_level,
             max_tokens=max_tokens,
@@ -1480,7 +1626,7 @@ async def generate_round_planning(
             if len(planning_text) > 50:
                 return planning_text, raw_text, usage, route
 
-        response_plan = raw_text.strip()
+        response_plan = extract_fenced_text(raw_text, "markdown")
         if len(response_plan) > 50:
             planning_file.write_text(response_plan + "\n", encoding="utf-8")
             return response_plan, raw_text, usage, route
@@ -1518,7 +1664,7 @@ def _truncate_text(text: str | None, limit: int) -> str:
 
 
 def _parse_round_summary(raw_text: str) -> dict[str, str]:
-    """Parse the four compact memory fields from Codex output."""
+    """Parse the four compact memory fields from harness output."""
     text = raw_text.strip()
     candidates = [text]
 
@@ -1547,7 +1693,7 @@ def _parse_round_summary(raw_text: str) -> dict[str, str]:
                 "relative_change": relative_change[:240],
             }
 
-    raise ValueError("Codex summary response did not contain valid JSON fields")
+    raise ValueError("Harness summary response did not contain valid JSON fields")
 
 
 def classify_validation_failure(status: str, feedback: str) -> dict[str, Any]:
@@ -1675,7 +1821,7 @@ def inspect_solution_contract(code: str) -> dict[str, Any]:
     }
 
 
-async def call_codex_round_summary(
+async def call_harness_round_summary(
     work_dir: Path,
     metadata: dict[str, Any],
     round_num: int,
@@ -1683,11 +1829,12 @@ async def call_codex_round_summary(
     validation_feedback: str,
     validation_status: str,
     validation_score: float | None,
+    harness_model: str,
     model: str,
     reasoning_level: str,
     trace_file: Path | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    """Ask Codex for brief method/result notes before archiving a commit."""
+    """Ask the selected harness for notes before archiving a commit."""
     work_dir.mkdir(parents=True, exist_ok=True)
 
     score_text = f"{validation_score:.6f}" if validation_score is not None else "N/A"
@@ -1718,71 +1865,22 @@ Validation score: {score_text}
 {_truncate_text(validation_feedback, 6000)}
 """.strip()
 
-    cmd = [
-        "codex",
-        "exec",
-        "--full-auto",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--model",
-        model,
-        "-c",
-        f"reasoning_level={json.dumps(reasoning_level)}",
-    ]
-
-    start_time = datetime.now()
-    trace_data = {
-        "timestamp": start_time.isoformat(),
-        "model": model,
-        "reasoning_level": reasoning_level,
-        "work_dir": str(work_dir),
-        "task_name": metadata.get("task_name", "unknown"),
-        "round": round_num,
-        "prompt": prompt,
-        "cmd": cmd,
-        "response_text": "",
-        "stderr": "",
-        "return_code": None,
-        "usage": {},
-        "duration_seconds": 0,
-    }
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(work_dir),
-        env=dict(os.environ),
+    response_text, usage = await run_harness_prompt(
+        work_dir=work_dir,
+        prompt=prompt,
+        system_prompt="Return only the requested compact JSON and do not modify files.",
+        harness_model=harness_model,
+        model=model,
+        reasoning_level=reasoning_level,
+        max_tokens=2048,
+        temperature=0.0,
+        trace_file=trace_file,
+        trace_context={
+            "task_name": metadata.get("task_name", "unknown"),
+            "round": round_num,
+            "phase_name": "summary",
+        },
     )
-    stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
-
-    response_text = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
-    usage = {
-        "input_tokens": len(prompt) // 4,
-        "output_tokens": len(response_text) // 4,
-    }
-
-    end_time = datetime.now()
-    trace_data["response_text"] = response_text
-    trace_data["stderr"] = stderr_text
-    trace_data["return_code"] = proc.returncode
-    trace_data["usage"] = usage
-    trace_data["duration_seconds"] = (end_time - start_time).total_seconds()
-    trace_data["end_timestamp"] = end_time.isoformat()
-
-    if trace_file:
-        trace_file.parent.mkdir(parents=True, exist_ok=True)
-        trace_file.write_text(
-            json.dumps(trace_data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Codex summary call failed with code {proc.returncode}: {stderr_text[:500]}"
-        )
-
     return _parse_round_summary(response_text), usage
 
 
@@ -1798,6 +1896,7 @@ async def update_memory_after_round(
     validation_status: str,
     validation_score: float | None,
     round_summary: dict[str, str],
+    harness_model: str,
     model: str,
     reasoning_level: str,
 ) -> dict[str, Any]:
@@ -1858,68 +1957,34 @@ Higher is better: {metadata.get("higher_is_better", "unknown")}
 {_truncate_text(validation_feedback, 12000)}
 """.strip()
 
-    cmd = [
-        "codex",
-        "exec",
-        "--full-auto",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--model",
-        model,
-        "-c",
-        f"reasoning_level={json.dumps(reasoning_level)}",
-    ]
     trace_file = task_dir / "traces" / f"round_{round_num}_memory_update_trace.json"
-    start_time = datetime.now()
-    trace_data = {
-        "timestamp": start_time.isoformat(),
-        "model": model,
-        "reasoning_level": reasoning_level,
-        "task_name": task_name,
-        "round": round_num,
-        "commit_hash": commit_hash,
-        "branch": branch,
-        "memory_file": str(memory_file),
-        "prompt": prompt,
-        "cmd": cmd,
-        "response_text": "",
-        "stderr": "",
-        "return_code": None,
-        "usage": {},
-        "duration_seconds": 0,
-    }
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(memories_dir),
-        env=dict(os.environ),
+    response_text, usage = await run_harness_prompt(
+        work_dir=memories_dir,
+        prompt=(
+            f"[OUTPUT CONTRACT]\n{CLAUDE_OUTPUT_GUARDS['memory']}\n\n{prompt}"
+            if harness_model == HARNESS_CLAUDE_CODE
+            else prompt
+        ),
+        system_prompt="Maintain compact evidence-based task memory and follow the requested output contract.",
+        harness_model=harness_model,
+        model=model,
+        reasoning_level=reasoning_level,
+        max_tokens=12000,
+        temperature=0.0,
+        trace_file=trace_file,
+        trace_context={
+            "task_name": task_name,
+            "round": round_num,
+            "commit_hash": commit_hash,
+            "branch": branch,
+            "memory_file": str(memory_file),
+            "phase_name": "memory",
+        },
     )
-    stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
-    response_text = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
-    usage = {
-        "input_tokens": len(prompt) // 4,
-        "output_tokens": len(response_text) // 4,
-    }
-    end_time = datetime.now()
-    trace_data["response_text"] = response_text
-    trace_data["stderr"] = stderr_text
-    trace_data["return_code"] = proc.returncode
-    trace_data["usage"] = usage
-    trace_data["duration_seconds"] = (end_time - start_time).total_seconds()
-    trace_data["end_timestamp"] = end_time.isoformat()
-    trace_file.write_text(
-        json.dumps(trace_data, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-
-    if proc.returncode != 0:
-        logger.warning(
-            "[%s] Memory update Codex call failed: %s", task_name, stderr_text[:500]
-        )
-        return {"status": "failed", "usage": usage, "error": stderr_text[:500]}
+    if harness_model == HARNESS_CLAUDE_CODE:
+        memory_text = extract_fenced_text(response_text, "markdown")
+        if memory_text:
+            memory_file.write_text(memory_text.rstrip() + "\n", encoding="utf-8")
     if not memory_file.exists() or not memory_file.read_text(encoding="utf-8").strip():
         fallback = (
             "# Task Memory\n\n"
@@ -1943,6 +2008,7 @@ async def evaluate_single_task_single_round(
     task: dict[str, Any],
     round_num: int,
     output_dir: Path,
+    harness_model: str,
     model: str,
     reasoning_level: str,
     max_tokens: int,
@@ -1997,6 +2063,7 @@ async def evaluate_single_task_single_round(
                     round_num=round_num,
                     prompt_messages=prompt_messages,
                     metadata=metadata,
+                    harness_model=harness_model,
                     model=model,
                     reasoning_level=reasoning_level,
                     max_tokens=max_tokens,
@@ -2106,11 +2173,12 @@ async def evaluate_single_task_single_round(
                 solution_file.unlink()
 
         try:
-            response_text, attempt_usage = await call_codex_cli(
+            response_text, attempt_usage = await call_harness_cli(
                 work_dir=work_dir,
                 prompt_messages=prompt_messages,
                 metadata=metadata,
                 system_prompt=SYSTEM_PROMPT,
+                harness_model=harness_model,
                 model=model,
                 reasoning_level=reasoning_level,
                 max_tokens=max_tokens,
@@ -2148,7 +2216,7 @@ async def evaluate_single_task_single_round(
             round_num + 1,
             retry_idx + 1,
         )
-        code = extract_code(response_text)
+        code = extract_python_code(response_text)
         if code and len(code.strip()) > 100:
             solution_file.write_text(code, encoding="utf-8")
             logger.info(
@@ -2307,7 +2375,7 @@ async def evaluate_single_task_single_round(
 
     summary_trace_file = output_dir / "traces" / f"round_{round_num}_summary_trace.json"
     try:
-        round_summary, summary_usage = await call_codex_round_summary(
+        round_summary, summary_usage = await call_harness_round_summary(
             work_dir=output_dir / "traces",
             metadata=metadata,
             round_num=round_num,
@@ -2315,6 +2383,7 @@ async def evaluate_single_task_single_round(
             validation_feedback=val_feedback,
             validation_status=val_status,
             validation_score=val_score,
+            harness_model=harness_model,
             model=model,
             reasoning_level=reasoning_level,
             trace_file=summary_trace_file,
@@ -2328,7 +2397,7 @@ async def evaluate_single_task_single_round(
         )
         score_text = f"{val_score:.4f}" if val_score is not None else "N/A"
         round_summary = {
-            "method_summary": "Codex summary unavailable; inspect solution.py for method details.",
+            "method_summary": "Harness summary unavailable; inspect solution.py for method details.",
             "result_reflection": f"Validation status={val_status}, score={score_text}; inspect feedback before reusing this attempt.",
             "method_category": "",
             "relative_change": "",
@@ -2446,6 +2515,7 @@ async def evaluate_single_task_single_round(
             validation_status=val_status,
             validation_score=val_score,
             round_summary=round_summary,
+            harness_model=harness_model,
             model=model,
             reasoning_level=reasoning_level,
         )
@@ -2601,6 +2671,7 @@ async def evaluate_single_task_multi_rounds(
     sandbox_client: httpx.AsyncClient,
     task: dict[str, Any],
     output_dir: Path,
+    harness_model: str,
     model: str,
     reasoning_level: str,
     max_tokens: int,
@@ -2667,6 +2738,7 @@ async def evaluate_single_task_multi_rounds(
             task=task,
             round_num=round_num,
             output_dir=output_dir,
+            harness_model=harness_model,
             model=model,
             reasoning_level=reasoning_level,
             max_tokens=max_tokens,
@@ -2779,6 +2851,7 @@ async def evaluate_tasks_concurrent(
     sandbox_client: httpx.AsyncClient,
     tasks: list[dict[str, Any]],
     output_path: Path,
+    harness_model: str,
     model: str,
     reasoning_level: str,
     max_tokens: int,
@@ -2807,6 +2880,7 @@ async def evaluate_tasks_concurrent(
                 sandbox_client=sandbox_client,
                 task=task,
                 output_dir=task_output_dir,
+                harness_model=harness_model,
                 model=model,
                 reasoning_level=reasoning_level,
                 max_tokens=max_tokens,
@@ -2847,9 +2921,10 @@ async def evaluate_tasks_concurrent(
 
 
 async def main(
-    data_file: str,
     output_dir: str,
-    model: str = "o4-mini",
+    data_file: str = str(DEFAULT_DATA_FILE),
+    harness_model: str = HARNESS_CODEX,
+    model: str | None = None,
     reasoning_level: str = "high",
     max_tokens: int = 100000,
     temperature: float = 0.6,
@@ -2862,6 +2937,7 @@ async def main(
     error_skill_file: str = str(DEFAULT_ERROR_SKILL_FILE),
 ) -> None:
     """Main evaluation function."""
+    harness_model, model = resolve_harness_and_model(harness_model, model)
     data_path = Path(data_file)
     if data_path.suffix == ".json":
         tasks = json.loads(data_path.read_text(encoding="utf-8"))
@@ -2886,7 +2962,8 @@ async def main(
         raise ValueError("branch_strategy must be one of: adaptive, branch_cycle")
 
     logger.info(
-        "Configuration: model=%s, reasoning_level=%s, rounds=%s, concurrency=%s, time_budget=%ss",
+        "Configuration: harness_model=%s, model=%s, reasoning_level=%s, rounds=%s, concurrency=%s, time_budget=%ss",
+        harness_model,
         model,
         reasoning_level,
         num_rounds,
@@ -2901,6 +2978,7 @@ async def main(
 
     config = {
         "data_file": data_file,
+        "harness_model": harness_model,
         "model": model,
         "reasoning_level": reasoning_level,
         "max_tokens": max_tokens,
@@ -2938,6 +3016,7 @@ async def main(
             sandbox_client=sandbox_client,
             tasks=tasks,
             output_path=output_path,
+            harness_model=harness_model,
             model=model,
             reasoning_level=reasoning_level,
             max_tokens=max_tokens,
@@ -2967,17 +3046,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data-file",
         type=str,
-        required=True,
-        help="Path to task data file (JSON or Parquet)",
+        default=os.environ.get("MLE_DATA_FILE", str(DEFAULT_DATA_FILE)),
+        help=f"Path to task data file (JSON or Parquet; default: {DEFAULT_DATA_FILE})",
     )
     parser.add_argument(
         "--output-dir", type=str, required=True, help="Output directory for results"
     )
     parser.add_argument(
-        "--model", type=str, default="o4-mini", help="OpenAI model to use"
+        "--harness-model",
+        type=str,
+        default=os.environ.get("MLE_HARNESS_MODEL", HARNESS_CODEX),
+        choices=HARNESS_CHOICES,
+        help="Coding-agent harness: codex for GPT models, claude-code for non-GPT API models",
     )
     parser.add_argument(
-        "--reasoning-level", type=str, default="high", help="Codex reasoning level"
+        "--model",
+        type=str,
+        default=os.environ.get("MLE_MODEL") or None,
+        help="API model name; defaults to gpt-5.4 for codex or claude-sonnet-4-6-cc for claude-code",
+    )
+    parser.add_argument(
+        "--reasoning-level",
+        type=str,
+        default="high",
+        help="Codex reasoning level (accepted but not passed to Claude Code)",
     )
     parser.add_argument(
         "--max-tokens", type=int, default=100000, help="Maximum tokens for generation"
@@ -3034,6 +3126,7 @@ if __name__ == "__main__":
         main(
             data_file=args.data_file,
             output_dir=args.output_dir,
+            harness_model=args.harness_model,
             model=args.model,
             reasoning_level=args.reasoning_level,
             max_tokens=args.max_tokens,

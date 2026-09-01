@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 TASK_NAME=""
-DATA_FILE=""
+DATA_FILE="${MLE_DATA_FILE:-/hpc_data/ktian/superml/dataset/automl_parquet_valid_low_current_fixed/eval.parquet}"
 OUTPUT_BASE="$REPOSITORY_ROOT/runs"
-MODEL="${MLE_MODEL:-gpt-5.4}"
+HARNESS_MODEL="${MLE_HARNESS_MODEL:-codex}"
+MODEL="${MLE_MODEL:-}"
 REASONING_LEVEL="${MLE_REASONING_LEVEL:-medium}"
 NUM_ROUNDS=3
 TIME_BUDGET=43200
@@ -19,7 +20,7 @@ BRANCH_STRATEGY="adaptive"
 WARMUP_BRANCHES="draft,improve"
 
 usage() {
-    echo "Usage: $0 --task-name NAME --data-file PATH [options]"
+    echo "Usage: $0 --task-name NAME [--data-file PATH] [options]"
     echo "Run '$0 --help' for the complete option list."
 }
 
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
         --task-name) TASK_NAME="$2"; shift 2 ;;
         --data-file) DATA_FILE="$2"; shift 2 ;;
         --output-dir) OUTPUT_BASE="$2"; shift 2 ;;
+        --harness-model) HARNESS_MODEL="$2"; shift 2 ;;
         --model) MODEL="$2"; shift 2 ;;
         --reasoning-level) REASONING_LEVEL="$2"; shift 2 ;;
         --num-rounds) NUM_ROUNDS="$2"; shift 2 ;;
@@ -41,8 +43,8 @@ while [[ $# -gt 0 ]]; do
         --help)
             usage
             echo ""
-            echo "Required: --task-name, --data-file"
-            echo "Common:   --output-dir, --model, --reasoning-level, --num-rounds"
+            echo "Required: --task-name"
+            echo "Common:   --data-file, --output-dir, --harness-model, --model, --reasoning-level, --num-rounds"
             echo "Assets:   --task-skills-dir, --error-skill-file"
             exit 0
             ;;
@@ -50,8 +52,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$TASK_NAME" || -z "$DATA_FILE" ]]; then
+if [[ -z "$TASK_NAME" ]]; then
     usage >&2
+    exit 2
+fi
+
+if [[ -z "$MODEL" ]]; then
+    if [[ "$HARNESS_MODEL" == "codex" ]]; then
+        MODEL="gpt-5.4"
+    elif [[ "$HARNESS_MODEL" == "claude-code" ]]; then
+        MODEL="claude-sonnet-4-6-cc"
+    else
+        echo "Unknown harness model: $HARNESS_MODEL (expected codex or claude-code)" >&2
+        exit 2
+    fi
+fi
+
+if [[ ! -f "$DATA_FILE" ]]; then
+    echo "Task data file not found: $DATA_FILE" >&2
     exit 2
 fi
 
@@ -64,9 +82,10 @@ python3 "$SCRIPT_DIR/select_task.py" \
     --output-file "$TMPFILE"
 
 OUTPUT_DIR="$OUTPUT_BASE/$TASK_NAME"
-python3 "$REPOSITORY_ROOT/evaluate_codex.py" \
+python3 "$REPOSITORY_ROOT/evaluate.py" \
     --data-file "$TMPFILE" \
     --output-dir "$OUTPUT_DIR" \
+    --harness-model "$HARNESS_MODEL" \
     --model "$MODEL" \
     --reasoning-level "$REASONING_LEVEL" \
     --num-rounds "$NUM_ROUNDS" \

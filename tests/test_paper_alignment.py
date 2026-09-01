@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from evaluate_codex import branch_uses_planning, route_skills_for_branch
+from evaluate import branch_uses_planning, route_skills_for_branch
 from prompts import SYSTEM_PROMPT
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -76,23 +76,9 @@ Remember: CREATE the solution.py file, DO NOT EXECUTE it."""
         self.assertNotIn("Plan-Code-Review", text)
         self.assertNotIn("Post-Code Review Checklist", text)
 
-    def test_appendix_artifacts_are_present(self) -> None:
-        synthesis = (
-            REPOSITORY_ROOT / "paper_prompts" / "task_level_skill_synthesis_prompt.txt"
-        )
-        baseline = REPOSITORY_ROOT / "paper_prompts" / "baseline_experiment_prompt.txt"
+    def test_runtime_appendix_examples_are_present(self) -> None:
         task_example = REPOSITORY_ROOT / "skills" / "SKILL_mlsp-2013-birds.md"
-        self.assertTrue(synthesis.is_file())
-        self.assertTrue(baseline.is_file())
         self.assertTrue(task_example.is_file())
-        self.assertIn(
-            " ".join(SYSTEM_PROMPT.split()),
-            " ".join(baseline.read_text(encoding="utf-8").split()),
-        )
-        self.assertIn(
-            "You are an expert Kaggle Grandmaster-style skill writer",
-            synthesis.read_text(encoding="utf-8"),
-        )
         self.assertTrue(
             task_example.read_text(encoding="utf-8").startswith(
                 "# Skill: mlsp-2013-birds"

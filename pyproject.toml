@@ -20,7 +20,7 @@ dependencies = [
 dev = ["ruff>=0.6.0"]
 
 [tool.setuptools]
-py-modules = ["evaluate_codex", "prompts"]
+py-modules = ["evaluate", "prompts"]
 
 [tool.setuptools.packages.find]
 include = ["scripts*", "tts_search*"]
