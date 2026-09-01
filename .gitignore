@@ -1,0 +1,25 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+._*
+__MACOSX/
+
+# Local authentication and machine-specific configuration
+.codex/
+.kaggle/
+auth.json
+kaggle.json
+*.pem
+*.key
+
+# Private/external assets and generated runs
+external/
+runs/
+outputs/
+*.log

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ers-mle-framework"
+version = "1.0.0"
+description = "Experience Routed Search for multi-round MLE-bench evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "black>=24.0.0",
+  "httpx>=0.27.0",
+  "pandas>=2.0.0",
+  "pyarrow>=14.0.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6.0"]
+
+[tool.setuptools]
+py-modules = ["evaluate_codex", "prompts"]
+
+[tool.setuptools.packages.find]
+include = ["scripts*", "tts_search*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
